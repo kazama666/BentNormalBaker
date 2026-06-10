@@ -15,7 +15,8 @@ ATTRIBUTE_TANGENT = "Tangent"
 ATTRIBUTE_COEFFS_0 = "SH0"
 ATTRIBUTE_COEFFS_1 = "SH1"
 
-PI_2 = 2 * np.pi  
+PI_2 = 2 * np.pi
+_IRRADIANCE_SH_CACHE = {}
 
 # 一阶球谐基函数常量系数
 Y00_COEFF = 0.5 * np.sqrt(1.0 / np.pi)
@@ -53,11 +54,15 @@ class Baker:
         
         # 初始化网格数据
         self.mesh.calc_loop_triangles()
-        self.mesh.calc_tangents()
 
         # 获取顶点数据
-        self.vertices = np.array([v.co for v in self.mesh.vertices], dtype=np.float32)
-        self.normals = np.array([v.normal for v in self.mesh.vertices], dtype=np.float32)
+        vertex_count = len(self.mesh.vertices)
+        self.vertices = np.empty(vertex_count * 3, dtype=np.float32)
+        self.normals = np.empty(vertex_count * 3, dtype=np.float32)
+        self.mesh.vertices.foreach_get("co", self.vertices)
+        self.mesh.vertices.foreach_get("normal", self.normals)
+        self.vertices = self.vertices.reshape(vertex_count, 3)
+        self.normals = self.normals.reshape(vertex_count, 3)
         if self.args["reverse_normal"]:
             self.normals = -self.normals
         self.tangents, self.bitangents = self._compute_tangent_space()
@@ -66,8 +71,8 @@ class Baker:
         self.temp_obj = self._create_temp_collision_object()
         
         # 创建BVH树
-        self.bvh = BVHTree.FromObject(self.temp_obj, self.context.evaluated_depsgraph_get())
-        
+        self.bvh = BVHTree.FromObject(self.temp_obj, self.context.evaluated_depsgraph_get()) if self.temp_obj else None
+
         # 计算采样方向
         self.sample_dirs = self._generate_sample_directions()
 
@@ -91,53 +96,47 @@ class Baker:
         """创建临时碰撞对象"""
         if self.args["collection_name"] not in bpy.data.collections:
             return None
-            
+
         temp_mesh_objects = [obj for obj in bpy.data.collections[self.args["collection_name"]].objects if obj.type == 'MESH']
         if not temp_mesh_objects:
             return None
-            
-        # 创建临时对象
+
+        vertices = []
+        faces = []
+        depsgraph = self.context.evaluated_depsgraph_get()
+        target_matrix_inverted = self.mesh_obj.matrix_world.inverted()
+
+        for obj in temp_mesh_objects:
+            evaluated_obj = obj.evaluated_get(depsgraph)
+            mesh = evaluated_obj.to_mesh()
+            if mesh is None:
+                continue
+
+            try:
+                vertex_offset = len(vertices)
+                matrix = target_matrix_inverted @ evaluated_obj.matrix_world
+                vertices.extend(matrix @ vertex.co for vertex in mesh.vertices)
+                faces.extend(tuple(vertex_offset + index for index in polygon.vertices) for polygon in mesh.polygons)
+            finally:
+                evaluated_obj.to_mesh_clear()
+
+        if not vertices or not faces:
+            return None
+
         temp_collision_mesh = bpy.data.meshes.new(TEMP_COLLISION_MESH_NAME)
+        temp_collision_mesh.from_pydata(vertices, [], faces)
+        temp_collision_mesh.update()
+
         temp_obj = bpy.data.objects.new("TempCollisionObj", temp_collision_mesh)
         bpy.context.scene.collection.objects.link(temp_obj)
-
-        # 复制并合并对象
-        copied_objects = []
-        copied_mesh_names = []
-        for obj in temp_mesh_objects:
-            obj_copy = obj.copy()
-            obj_copy.data = obj.data.copy()
-            copied_objects.append(obj_copy)
-            copied_mesh_names.append(obj_copy.data.name)
-            bpy.context.scene.collection.objects.link(obj_copy)
-        
-        # 设置选择状态并合并
-        original_active = self.context.view_layer.objects.active
-        self.mesh_obj.select_set(False)
-        for obj in copied_objects:
-            obj.select_set(True)
-        temp_obj.select_set(True)
-        self.context.view_layer.objects.active = temp_obj
-        
-        bpy.ops.object.join()
-
-        # 恢复选择状态
-        temp_obj.select_set(False)
-        self.mesh_obj.select_set(True)
-        self.context.view_layer.objects.active = original_active
-        
-        # 清理临时mesh
-        for name in copied_mesh_names:
-            if name in bpy.data.meshes:
-                bpy.data.meshes.remove(bpy.data.meshes[name], do_unlink=True)
-        
         return temp_obj
 
     def _compute_bent_normals(self,) -> None:
         """计算弯曲法线和AO"""
-        if not self.temp_obj:
-            return
-        sh_coeffs = self._compute_sh_coefficients_parallel()
+        if self.bvh is None:
+            sh_coeffs = self._compute_unoccluded_sh_coefficients()
+        else:
+            sh_coeffs = self._compute_sh_coefficients_parallel()
         self._store_results(sh_coeffs)
 
     def _generate_sample_directions(self) -> np.ndarray:
@@ -177,14 +176,32 @@ class Baker:
     
     def _compute_tangent_space(self,) -> tuple[np.ndarray, np.ndarray]:
         """计算切线空间"""
-        def compute_orthogonal(normal: np.ndarray) -> np.ndarray:
-            ref = np.array([1.0, 0.0, 0.0]) if abs(normal[1]) > abs(normal[0]) else np.array([0.0, 1.0, 0.0])
-            tangent = np.cross(normal, ref)
-            return tangent / np.linalg.norm(tangent)
-        
-        tangents = np.array([compute_orthogonal(n) for n in self.normals], dtype=np.float32)
+        refs = np.zeros_like(self.normals)
+        use_x = np.abs(self.normals[:, 1]) > np.abs(self.normals[:, 0])
+        refs[use_x, 0] = 1.0
+        refs[~use_x, 1] = 1.0
+
+        tangents = np.cross(self.normals, refs)
+        lengths = np.linalg.norm(tangents, axis=1, keepdims=True)
+        tangents = tangents / lengths
         bitangents = np.cross(self.normals, tangents)
-        return tangents, bitangents
+        return tangents.astype(np.float32), bitangents.astype(np.float32)
+
+    def _compute_unoccluded_sh_coefficients(self,) -> np.ndarray:
+        """计算无遮挡球谐系数"""
+        num_vertices = len(self.vertices)
+        sh_coeffs = np.zeros((num_vertices, 4), dtype=np.float32)
+
+        for i in range(num_vertices):
+            dirs = (self.tangents[i] * self.sample_dirs[:, 0:1] +
+                self.bitangents[i] * self.sample_dirs[:, 1:2] +
+                self.normals[i] * self.sample_dirs[:, 2:3])
+            sh_coeffs[i, 0] = Y00_COEFF
+            sh_coeffs[i, 1] = np.sum(Y10_COEFF * dirs[:, 2]) / len(self.sample_dirs)
+            sh_coeffs[i, 2] = np.sum(Y11_COEFF * dirs[:, 0]) / len(self.sample_dirs)
+            sh_coeffs[i, 3] = np.sum(Y1_1_COEFF * dirs[:, 1]) / len(self.sample_dirs)
+
+        return sh_coeffs
 
     def _compute_sh_coefficients_parallel(self,) -> np.ndarray:
         """并行计算球谐系数"""
@@ -201,44 +218,77 @@ class Baker:
             results = list(executor.map(lambda args: self._process_vertex_batch(*args), tasks))
         
         # 合并结果
-        sh_coeffs = np.concatenate(results)
-        return sh_coeffs / len(self.sample_dirs)
+        return np.concatenate(results)
     
     def _process_vertex_batch(self, start_idx:int, end_idx:int,) -> np.ndarray:
         """处理一批顶点的计算"""
         sh_coeffs = np.zeros((end_idx - start_idx, 4), dtype=np.float32)
-        ray_starts = self.vertices[start_idx:end_idx] + self.normals[start_idx:end_idx] * self.args["ray_offset"]
-        
-        for i in range(end_idx - start_idx):
-            dirs = (self.tangents[start_idx + i] * self.sample_dirs[:, 0:1] + 
-                self.bitangents[start_idx + i] * self.sample_dirs[:, 1:2] + 
-                self.normals[start_idx + i] * self.sample_dirs[:, 2:3])
-            
-            for dir in dirs:
-                _, _, index, distance = self.bvh.ray_cast(
-                    Vector(ray_starts[i]),
-                    Vector(dir),
-                    self.args["max_distance"]
-                )
-                
-                # 计算球谐基函数
-                y00 = Y00_COEFF  # Y00系数
-                y10 = Y10_COEFF * dir[2]  # Y10系数
-                y11 = Y11_COEFF * dir[0]  # Y11系数
-                y1_1 = Y1_1_COEFF * dir[1]  # Y1-1系数
-                
-                if index is None:
-                    weight = 1.0
-                else:
-                    weight = min(self.args["max_distance"], distance / self.args["max_distance"])
-                
-                # 累加球谐系数
-                sh_coeffs[i][0] += y00 * weight  # Y00
-                sh_coeffs[i][1] += y10 * weight  # Y10
-                sh_coeffs[i][2] += y11 * weight  # Y11
-                sh_coeffs[i][3] += y1_1 * weight # Y1-1
-        
-        return sh_coeffs
+        vertices = self.vertices
+        normals = self.normals
+        tangents = self.tangents
+        bitangents = self.bitangents
+        sample_dirs = self.sample_dirs
+        sample_count = len(sample_dirs)
+        inv_sample_count = 1.0 / sample_count
+        mean_sample_dir = sample_dirs.mean(axis=0)
+        ray_offset = self.args["ray_offset"]
+        max_distance = self.args["max_distance"]
+        ray_cast = self.bvh.ray_cast
+        find_nearest = self.bvh.find_nearest
+        ray_starts = vertices[start_idx:end_idx] + normals[start_idx:end_idx] * ray_offset
+        chunk_size = 1024
+
+        for chunk_start in range(start_idx, end_idx, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, end_idx)
+            chunk_slice = slice(chunk_start, chunk_end)
+            chunk_tangents = tangents[chunk_slice]
+            chunk_bitangents = bitangents[chunk_slice]
+            chunk_normals = normals[chunk_slice]
+            chunk_dirs = (chunk_tangents[:, np.newaxis, :] * sample_dirs[np.newaxis, :, 0:1] +
+                chunk_bitangents[:, np.newaxis, :] * sample_dirs[np.newaxis, :, 1:2] +
+                chunk_normals[:, np.newaxis, :] * sample_dirs[np.newaxis, :, 2:3])
+            chunk_mean_dirs = (chunk_tangents * mean_sample_dir[0] +
+                chunk_bitangents * mean_sample_dir[1] +
+                chunk_normals * mean_sample_dir[2])
+
+            for local_i in range(chunk_end - chunk_start):
+                output_index = chunk_start - start_idx + local_i
+                ray_start = Vector(ray_starts[output_index])
+
+                if find_nearest(ray_start, max_distance)[0] is None:
+                    mean_direction = chunk_mean_dirs[local_i]
+                    sh_coeffs[output_index] = (
+                        Y00_COEFF * sample_count,
+                        Y10_COEFF * mean_direction[2] * sample_count,
+                        Y11_COEFF * mean_direction[0] * sample_count,
+                        Y1_1_COEFF * mean_direction[1] * sample_count,
+                    )
+                    continue
+
+                c0 = c10 = c11 = c1_1 = 0.0
+                direction = Vector((0.0, 0.0, 0.0))
+
+                for sample_index in range(sample_count):
+                    sample_direction = chunk_dirs[local_i, sample_index]
+                    direction[0] = sample_direction[0]
+                    direction[1] = sample_direction[1]
+                    direction[2] = sample_direction[2]
+
+                    _, _, index, distance = ray_cast(ray_start, direction, max_distance)
+
+                    if index is None:
+                        weight = 1.0
+                    else:
+                        weight = min(max_distance, distance / max_distance)
+
+                    c0 += Y00_COEFF * weight
+                    c10 += Y10_COEFF * sample_direction[2] * weight
+                    c11 += Y11_COEFF * sample_direction[0] * weight
+                    c1_1 += Y1_1_COEFF * sample_direction[1] * weight
+
+                sh_coeffs[output_index] = (c0, c10, c11, c1_1)
+
+        return sh_coeffs * inv_sample_count
 
     def _store_results(self, sh_coeffs: np.ndarray) -> None:
         """存储计算结果"""
@@ -253,21 +303,22 @@ class Baker:
         sh1_attr = self.mesh.attributes[ATTRIBUTE_COEFFS_1]
         tangent_attr = self.mesh.attributes[ATTRIBUTE_TANGENT]
         
-        # 保存Y00系数
-        for vert in self.mesh.vertices:
-            sh0_attr.data[vert.index].value = sh_coeffs[vert.index][0]
-        
-        for loop in self.mesh.loops:
-            # 保存BentNormal Y10, Y11, Y1-1系数
-            # 这里调整了位置与正负，对应xyz坐标系中的弯曲法线
-            sh1_attr.data[loop.index].vector = Vector((
-                -sh_coeffs[loop.vertex_index][2],  # Y11
-                sh_coeffs[loop.vertex_index][3],   # Y1-1
-                sh_coeffs[loop.vertex_index][1]    # Y10
-            ))
-            # 保存Tangent
-            tangent_attr.data[loop.index].vector = self.mesh.loops[loop.index].tangent
-            # tangent_attr.data[loop.vertex_index].vector = self.mesh.loops[loop.index].tangent
+        sh0_attr.data.foreach_set("value", sh_coeffs[:, 0])
+
+        loop_count = len(self.mesh.loops)
+        loop_vertex_indices = np.empty(loop_count, dtype=np.int32)
+        self.mesh.loops.foreach_get("vertex_index", loop_vertex_indices)
+
+        sh1_values = np.empty((loop_count, 3), dtype=np.float32)
+        loop_coeffs = sh_coeffs[loop_vertex_indices]
+        sh1_values[:, 0] = -loop_coeffs[:, 2]
+        sh1_values[:, 1] = loop_coeffs[:, 3]
+        sh1_values[:, 2] = loop_coeffs[:, 1]
+        sh1_attr.data.foreach_set("vector", sh1_values.ravel())
+
+        tangent_values = self.tangents[loop_vertex_indices]
+        tangent_attr.data.foreach_set("vector", tangent_values.ravel())
+        self.mesh.update()
 
     def _cleanup_temp_objects(self) -> None:
             """清理临时对象"""
@@ -295,69 +346,40 @@ def image_to_sh_coeffs(image: bpy.types.Image) -> list[Vector]:
     Returns:
         list[Vector]: 9个二阶球谐系数 (Y00, Y1-1, Y10, Y11, Y2-2, Y2-1, Y20, Y21, Y22)
     """
-    # 获取图像像素数据
     width, height = image.size
-    pixels = np.array(image.pixels).reshape(height, width, 4)
-    
-    # 重新采样到 256x128
-    target_height, target_width = 128, 256
-    h_indices = np.linspace(0, height-1, target_height).astype(int)
-    w_indices = np.linspace(0, width-1, target_width).astype(int)
-    pixels = pixels[h_indices][:, w_indices]
-    
-    height, width = target_height, target_width
-    
-    # 转换为球面坐标
-    theta = np.linspace(0, np.pi, height)
-    phi = np.linspace(0, 2 * np.pi, width)
-    theta_grid, phi_grid = np.meshgrid(theta, phi, indexing='ij')
-    
-    # 计算球谐基函数
-    sh_coeffs = np.zeros((9, 3), dtype=np.float32)  # 改为存储RGB三个通道
-    
-    # 遍历所有像素
-    for i in range(height):
-        for j in range(width):
-            # 获取当前像素的颜色值
-            color = pixels[i, j, :3]  # 直接使用RGB颜色值
-            
-            # 计算球谐基函数值
-            theta = theta_grid[i, j]
-            phi = phi_grid[i, j]
-            x = np.sin(theta) * np.cos(phi)
-            y = np.sin(theta) * np.sin(phi)
-            z = np.cos(theta)
-            
-            # 计算球谐基函数
-            sh_basis = np.array([
-                Y00_COEFF,  # Y00
-                Y1_1_COEFF * y,  # Y1-1
-                Y10_COEFF * z,  # Y10
-                Y11_COEFF * x,  # Y11
-                Y2_2_COEFF * (x * y),  # Y2-2
-                Y2_1_COEFF * (y * z),  # Y2-1
-                Y20_COEFF * (3 * z * z - 1) / 2,  # Y20
-                Y21_COEFF * (x * z),  # Y21
-                Y22_COEFF * (x * x - y * y) / 2  # Y22
-            ])
-            
-            # 添加sin(theta)作为积分权重
-            weight = np.sin(theta) * (2 * np.pi / width) * (np.pi / height)
-            sh_coeffs += sh_basis[:, np.newaxis] * color * weight
+    pixels = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    pixels = pixels.reshape(height, width, 4)
 
-    # 将球谐系数转换为Vector数组
-    sh_coeffs = [
-        Vector(sh_coeffs[0]),  # Y00
-        Vector(sh_coeffs[1]),  # Y1-1
-        Vector(sh_coeffs[2]),  # Y10
-        Vector(sh_coeffs[3]),  # Y11
-        Vector(sh_coeffs[4]),  # Y2-2
-        Vector(sh_coeffs[5]),  # Y2-1
-        Vector(sh_coeffs[6]),  # Y20
-        Vector(sh_coeffs[7]),  # Y21
-        Vector(sh_coeffs[8])   # Y22
-    ]
-    return sh_coeffs
+    target_height, target_width = 128, 256
+    h_indices = np.linspace(0, height - 1, target_height).astype(int)
+    w_indices = np.linspace(0, width - 1, target_width).astype(int)
+    colors = pixels[np.ix_(h_indices, w_indices)][:, :, :3]
+
+    theta = np.linspace(0, np.pi, target_height, dtype=np.float32)
+    phi = np.linspace(0, 2 * np.pi, target_width, dtype=np.float32)
+    theta_grid, phi_grid = np.meshgrid(theta, phi, indexing='ij')
+
+    sin_theta = np.sin(theta_grid)
+    x = sin_theta * np.cos(phi_grid)
+    y = sin_theta * np.sin(phi_grid)
+    z = np.cos(theta_grid)
+
+    sh_basis = np.stack((
+        np.full_like(x, Y00_COEFF),
+        Y1_1_COEFF * y,
+        Y10_COEFF * z,
+        Y11_COEFF * x,
+        Y2_2_COEFF * (x * y),
+        Y2_1_COEFF * (y * z),
+        Y20_COEFF * (3 * z * z - 1) / 2,
+        Y21_COEFF * (x * z),
+        Y22_COEFF * (x * x - y * y) / 2,
+    ), axis=0)
+
+    weights = sin_theta * (2 * np.pi / target_width) * (np.pi / target_height)
+    sh_coeffs = np.einsum('khw,hwc,hw->kc', sh_basis, colors, weights, optimize=True)
+    return [Vector(coeff) for coeff in sh_coeffs]
 
 def bake_irradiance() -> bool:
     """
@@ -376,25 +398,24 @@ def bake_irradiance() -> bool:
     if image is None:
         return False
 
-    nodes = irradiance_node.nodes
-    def get_node_by_label(label):
-        for node in nodes:
-            if node.label == label:
-                return node
-        return None
-    
+    nodes_by_label = {node.label: node for node in irradiance_node.nodes}
+
     def assign_vector_values(node, vector):
         node.inputs[0].default_value = vector[0]
         node.inputs[1].default_value = vector[1]
         node.inputs[2].default_value = vector[2]
 
-    sh_coeffs = image_to_sh_coeffs(image)
+    cache_key = (image.name, tuple(image.size), image.filepath)
+    sh_coeffs = _IRRADIANCE_SH_CACHE.get(cache_key)
+    if sh_coeffs is None:
+        sh_coeffs = image_to_sh_coeffs(image)
+        _IRRADIANCE_SH_CACHE[cache_key] = sh_coeffs
     mat_node_names = ["y00", "y1_1", "y10", "y11", "y2_2", "y2_1", "y20", "y21", "y22"]
     debug_value_names = ["TEST_IRR_Y00", "TEST_IRR_Y1_1", "TEST_IRR_Y10", "TEST_IRR_Y11", "TEST_IRR_Y2_2", "TEST_IRR_Y2_1", "TEST_IRR_Y20", "TEST_IRR_Y21", "TEST_IRR_Y22"]
     
     for i, name in enumerate(mat_node_names):
         coeffs = sh_coeffs[i]
-        node = get_node_by_label(name)
+        node = nodes_by_label.get(name)
         if node:
             assign_vector_values(node, coeffs)
 
