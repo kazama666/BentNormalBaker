@@ -53,9 +53,9 @@ class BentNormalPropertyGroup(bpy.types.PropertyGroup):
     # 采样次数
     sample_count: bpy.props.IntProperty(
         name="Sample Count",
-        default=128,
-        min=64,
-        max=1024,
+        default=64,
+        min=32,
+        max=128,
         description="The number of sample rays per vertex"
     ) #type: ignore
 
