@@ -3,11 +3,10 @@ import bpy
 from mathutils import Vector
 import numpy as np
 from mathutils.bvhtree import BVHTree
-import time
+import os
 
 # 常量定义
 TEMP_COLLISION_MESH_NAME = "TempCollisionMesh"
-PROFILE_BATCHES = False
 
 ATTRIBUTE_TANGENT = "Tangent"
 ATTRIBUTE_COEFFS_0 = "SH0"
@@ -39,23 +38,21 @@ class Baker:
         sh_coeffs_y10: 顶点Attribute -> SH_1.z
     """
     def __init__(self, context: bpy.types.Context, mesh_obj: bpy.types.Object, args: dict):
-        """初始化烘焙器 
+        """初始化烘焙器
         Args:
             context: Blender上下文
             mesh_obj: 要烘焙的网格对象
             args: 烘焙参数
         """
-        init_start = time.perf_counter()
         self.context = context
         self.mesh_obj = mesh_obj
         self.mesh = mesh_obj.data
         self.args = args
 
-        step_start = time.perf_counter()
+        # 初始化网格数据
         self.mesh.calc_loop_triangles()
-        print(f"[BentNormalBaker] calc_loop_triangles: {time.perf_counter() - step_start:.3f}s")
 
-        step_start = time.perf_counter()
+        # 获取顶点数据
         vertex_count = len(self.mesh.vertices)
         self.vertices = np.empty(vertex_count * 3, dtype=np.float32)
         self.normals = np.empty(vertex_count * 3, dtype=np.float32)
@@ -65,38 +62,27 @@ class Baker:
         self.normals = self.normals.reshape(vertex_count, 3)
         if self.args["reverse_normal"]:
             self.normals = -self.normals
-        print(f"[BentNormalBaker] vertex/normal foreach_get: {time.perf_counter() - step_start:.3f}s")
-
-        step_start = time.perf_counter()
         self.tangents, self.bitangents = self._compute_tangent_space()
-        print(f"[BentNormalBaker] tangent space: {time.perf_counter() - step_start:.3f}s")
 
-        step_start = time.perf_counter()
+        # 创建临时碰撞对象
         self.temp_obj = self._create_temp_collision_object()
-        print(f"[BentNormalBaker] collision mesh build: {time.perf_counter() - step_start:.3f}s")
 
-        step_start = time.perf_counter()
+        # 创建BVH树
         self.bvh = BVHTree.FromObject(self.temp_obj, self.context.evaluated_depsgraph_get()) if self.temp_obj else None
-        print(f"[BentNormalBaker] BVH build: {time.perf_counter() - step_start:.3f}s")
 
-        step_start = time.perf_counter()
+        # 计算采样方向
         self.sample_dirs = self._generate_sample_directions()
-        print(f"[BentNormalBaker] sample directions: {time.perf_counter() - step_start:.3f}s")
-        print(f"[BentNormalBaker] init total: {time.perf_counter() - init_start:.3f}s")
 
     def bake(self,) -> None:
         """
         计算网格的弯曲法线和环境光遮蔽
         """
-        bake_start = time.perf_counter()
         try:
             # 计算弯曲法线和AO
             self._compute_bent_normals()
         finally:
-            cleanup_start = time.perf_counter()
+            # 清理临时对象
             self._cleanup_temp_objects()
-            print(f"[BentNormalBaker] cleanup temp objects: {time.perf_counter() - cleanup_start:.3f}s")
-            print(f"[BentNormalBaker] bake total: {time.perf_counter() - bake_start:.3f}s")
 
     def _ensure_attribute(self, name: str, type: str, domain: str) -> None:
         """确保属性存在"""
@@ -116,7 +102,6 @@ class Baker:
         faces = []
         depsgraph = self.context.evaluated_depsgraph_get()
         target_matrix_inverted = self.mesh_obj.matrix_world.inverted()
-        collect_start = time.perf_counter()
 
         for obj in temp_mesh_objects:
             evaluated_obj = obj.evaluated_get(depsgraph)
@@ -132,15 +117,12 @@ class Baker:
             finally:
                 evaluated_obj.to_mesh_clear()
 
-        print(f"[BentNormalBaker] collision collect evaluated meshes: {time.perf_counter() - collect_start:.3f}s")
         if not vertices or not faces:
             return None
 
-        from_pydata_start = time.perf_counter()
         temp_collision_mesh = bpy.data.meshes.new(TEMP_COLLISION_MESH_NAME)
         temp_collision_mesh.from_pydata(vertices, [], faces)
         temp_collision_mesh.update()
-        print(f"[BentNormalBaker] collision from_pydata/update: {time.perf_counter() - from_pydata_start:.3f}s")
 
         temp_obj = bpy.data.objects.new("TempCollisionObj", temp_collision_mesh)
         bpy.context.scene.collection.objects.link(temp_obj)
@@ -149,27 +131,21 @@ class Baker:
     def _compute_bent_normals(self,) -> None:
         """计算弯曲法线和AO"""
         if self.bvh is None:
-            step_start = time.perf_counter()
             sh_coeffs = self._compute_unoccluded_sh_coefficients()
-            print(f"[BentNormalBaker] compute unoccluded SH: {time.perf_counter() - step_start:.3f}s")
         else:
-            step_start = time.perf_counter()
             sh_coeffs = self._compute_sh_coefficients()
-            print(f"[BentNormalBaker] compute SH: {time.perf_counter() - step_start:.3f}s")
-        step_start = time.perf_counter()
         self._store_results(sh_coeffs)
-        print(f"[BentNormalBaker] store results: {time.perf_counter() - step_start:.3f}s")
 
     def _generate_sample_directions(self) -> np.ndarray:
         """在法线方向的锥形角度范围内生成均匀采样方向
-        
+
         Args:
             sample_count: 采样数量
             sample_angle: 最大采样角度（度）
         """
         sample_angle_rad = np.radians(self.args["sample_angle"])
         points = []
-        
+
         for i in range(self.args["sample_count"]):
             # 生成均匀分布的u和v
             u = 0.0
@@ -181,20 +157,20 @@ class Baker:
                 p *= 0.5
                 k >>= 1
             v = (i + 0.5) / self.args["sample_count"]
-            
+
             # 计算角度范围
             theta = sample_angle_rad * np.sqrt(u)  # 使用sqrt(u)使采样在角度范围内均匀分布
             phi = 2 * np.pi * v
-            
+
             # 转换为笛卡尔坐标
             x = np.sin(theta) * np.cos(phi)
             y = np.sin(theta) * np.sin(phi)
             z = np.cos(theta)
-            
+
             points.append([x, y, z])
-        
+
         return np.array(points, dtype=np.float32)
-    
+
     def _compute_tangent_space(self,) -> tuple[np.ndarray, np.ndarray]:
         """计算切线空间"""
         refs = np.zeros_like(self.normals)
@@ -226,10 +202,8 @@ class Baker:
 
     def _compute_sh_coefficients(self,) -> np.ndarray:
         """计算球谐系数"""
-        num_vertices = len(self.vertices)
-        print(f"[BentNormalBaker] SH task: vertices={num_vertices}, samples={len(self.sample_dirs)}")
-        return self._process_vertex_batch(0, num_vertices)
-    
+        return self._process_vertex_batch(0, len(self.vertices))
+
     def _process_vertex_batch(self, start_idx:int, end_idx:int,) -> np.ndarray:
         """处理一批顶点的计算"""
         sh_coeffs = np.zeros((end_idx - start_idx, 4), dtype=np.float32)
@@ -244,22 +218,16 @@ class Baker:
         max_distance = self.args["max_distance"]
         ray_cast = self.bvh.ray_cast
         ray_starts = vertices[start_idx:end_idx] + normals[start_idx:end_idx] * ray_offset
-        direction_transform_time = 0.0
-        ray_loop_time = 0.0
-        batch_start = time.perf_counter()
         weights = np.empty(sample_count, dtype=np.float32)
 
         for i in range(end_idx - start_idx):
             vertex_index = start_idx + i
-            direction_start = time.perf_counter()
             vertex_dirs = (tangents[vertex_index] * sample_dirs[:, 0:1] +
                 bitangents[vertex_index] * sample_dirs[:, 1:2] +
                 normals[vertex_index] * sample_dirs[:, 2:3])
-            direction_transform_time += time.perf_counter() - direction_start
 
             ray_start = Vector(ray_starts[i])
             direction = Vector((0.0, 0.0, 0.0))
-            ray_start_time = time.perf_counter()
 
             for sample_index in range(sample_count):
                 sample_direction = vertex_dirs[sample_index]
@@ -276,10 +244,7 @@ class Baker:
                 Y11_COEFF * np.dot(vertex_dirs[:, 0], weights),
                 Y1_1_COEFF * np.dot(vertex_dirs[:, 1], weights),
             )
-            ray_loop_time += time.perf_counter() - ray_start_time
 
-        if PROFILE_BATCHES:
-            print(f"[BentNormalBaker] batch {start_idx}-{end_idx}: total={time.perf_counter() - batch_start:.3f}s, direction_transform={direction_transform_time:.3f}s, ray_loop={ray_loop_time:.3f}s")
         return sh_coeffs * inv_sample_count
 
     def _store_results(self, sh_coeffs: np.ndarray) -> None:
@@ -288,13 +253,12 @@ class Baker:
         self._ensure_attribute(ATTRIBUTE_COEFFS_0, 'FLOAT', 'POINT')
         self._ensure_attribute(ATTRIBUTE_COEFFS_1, 'FLOAT_VECTOR', 'CORNER')
         self._ensure_attribute(ATTRIBUTE_TANGENT, 'FLOAT_VECTOR', 'CORNER')
-        # self._ensure_attribute(ATTRIBUTE_TANGENT, 'FLOAT_VECTOR', 'POINT')
 
         # 获取属性
         sh0_attr = self.mesh.attributes[ATTRIBUTE_COEFFS_0]
         sh1_attr = self.mesh.attributes[ATTRIBUTE_COEFFS_1]
         tangent_attr = self.mesh.attributes[ATTRIBUTE_TANGENT]
-        
+
         sh0_attr.data.foreach_set("value", sh_coeffs[:, 0])
 
         loop_count = len(self.mesh.loops)
@@ -378,16 +342,15 @@ def bake_irradiance() -> bool:
     将环境贴图烘焙到球谐系数
     给Debug Material的Irradiance使用
     """
-    irradiance_start = time.perf_counter()
     irradiance_node = bpy.data.node_groups["Sample_Irradiance"]
     if irradiance_node is None:
         return False
-    
+
     image = bpy.data.images.get("debug_environment.exr")
     if image is None:
         image_path = os.path.join(os.path.dirname(__file__), "assets/texture/debug_environment.exr")
         image = bpy.data.images.load(image_path)
-    
+
     if image is None:
         return False
 
@@ -401,15 +364,11 @@ def bake_irradiance() -> bool:
     cache_key = (image.name, tuple(image.size), image.filepath)
     sh_coeffs = _IRRADIANCE_SH_CACHE.get(cache_key)
     if sh_coeffs is None:
-        sh_start = time.perf_counter()
         sh_coeffs = image_to_sh_coeffs(image)
         _IRRADIANCE_SH_CACHE[cache_key] = sh_coeffs
-        print(f"[BentNormalBaker] irradiance image_to_sh_coeffs: {time.perf_counter() - sh_start:.3f}s")
-    else:
-        print("[BentNormalBaker] irradiance image_to_sh_coeffs: cached")
     mat_node_names = ["y00", "y1_1", "y10", "y11", "y2_2", "y2_1", "y20", "y21", "y22"]
     debug_value_names = ["TEST_IRR_Y00", "TEST_IRR_Y1_1", "TEST_IRR_Y10", "TEST_IRR_Y11", "TEST_IRR_Y2_2", "TEST_IRR_Y2_1", "TEST_IRR_Y20", "TEST_IRR_Y21", "TEST_IRR_Y22"]
-    
+
     for i, name in enumerate(mat_node_names):
         coeffs = sh_coeffs[i]
         node = nodes_by_label.get(name)
@@ -418,5 +377,4 @@ def bake_irradiance() -> bool:
 
         print(f"#define {debug_value_names[i]}  float3({coeffs[0]}, {coeffs[1]}, {coeffs[2]})")
 
-    print(f"[BentNormalBaker] bake_irradiance total: {time.perf_counter() - irradiance_start:.3f}s")
     return True
